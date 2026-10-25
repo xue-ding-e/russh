@@ -783,7 +783,10 @@ impl Session {
                         map_err!(ensure_end(&r))?;
                         return client.openssh_ext_host_keys_announced(keys, self).await;
                     } else {
-                        warn!("Unhandled global request: {req:?} {wants_reply:?}",);
+                        warn!(
+                            "Unhandled global request (name length: {} bytes, wants_reply: {wants_reply})",
+                            req.len()
+                        );
                         self.common.wants_reply = false;
                         push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
                     }

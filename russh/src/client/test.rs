@@ -237,4 +237,165 @@ mod tests {
         assert!(no_reply.is_none());
         session.tcpip_forward("127.0.0.1", 12345).await.unwrap();
     }
+
+    const PEER_REQUEST_NAME: &str = "russh-synthetic-peer-canary\n\u{1b}[31m\t@example.invalid";
+
+    #[test]
+    fn unhandled_global_request_warning_omits_peer_text() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // Other tests install a process-global logger. Run only this fixture in
+        // a child process so their order cannot affect the captured warnings.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::test::tests::unhandled_global_request_logging_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let failure = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break None,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    let _ = child.kill();
+                    break Some(format!("fixture did not finish: {result:?}"));
+                }
+            }
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let warnings = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            failure.is_none() && output.status.success(),
+            "fixture failed: {failure:?}\n{stdout}\n{warnings}"
+        );
+        assert!(
+            warnings.contains("synthetic logger control"),
+            "the warning logger must be active"
+        );
+        assert!(
+            !warnings.contains("russh-synthetic-peer-canary"),
+            "peer-controlled request text reached the warning logger"
+        );
+        for wants_reply in [0, 1] {
+            let expected = format!(
+                "Unhandled global request (name length: {} bytes, wants_reply: {wants_reply})",
+                PEER_REQUEST_NAME.len()
+            );
+            assert_eq!(warnings.matches(&expected).count(), 1, "{warnings}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "run in isolation by unhandled_global_request_warning_omits_peer_text"]
+    async fn unhandled_global_request_logging_fixture() {
+        use ssh_encoding::Encode;
+        use tokio::sync::oneshot;
+
+        use crate::session::GlobalRequestResponse;
+
+        struct RequestServer {
+            replies: Vec<(u8, oneshot::Sender<bool>)>,
+        }
+
+        impl ServerHandler for RequestServer {
+            type Error = Error;
+
+            async fn auth_none(&mut self, _: &str) -> Result<Auth, Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Error> {
+                for (wants_reply, reply) in self.replies.drain(..) {
+                    // Track the current failure reply for either flag value;
+                    // this logging regression does not change reply semantics.
+                    session
+                        .open_global_requests
+                        .push_back(GlobalRequestResponse::CancelTcpIpForward(reply));
+                    let enc = session.common.encrypted.as_mut().unwrap();
+                    push_packet!(enc.write, {
+                        crate::msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
+                        PEER_REQUEST_NAME.encode(&mut enc.write)?;
+                        wants_reply.encode(&mut enc.write)?;
+                    });
+                }
+                Ok(())
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                _: crate::Channel<server::Msg>,
+                reply: server::ChannelOpenHandle,
+                _: &mut Session,
+            ) -> Result<(), Error> {
+                reply.accept().await;
+                Ok(())
+            }
+        }
+
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .format_timestamp(None)
+            .init();
+        log::warn!(target: "russh::client::encrypted", "synthetic logger control");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut config = server::Config::default();
+            config
+                .keys
+                .push(PrivateKey::random(&mut rng(), ssh_key::Algorithm::Ed25519).unwrap());
+            let mut replies = Vec::new();
+            let mut results = Vec::new();
+            for wants_reply in [0, 1] {
+                let (reply, result) = oneshot::channel();
+                replies.push((wants_reply, reply));
+                results.push(result);
+            }
+
+            // Negotiate and authenticate real SSH sessions without sockets or
+            // external services, then send the synthetic request on the wire.
+            let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+            let (server, client) = tokio::join!(
+                server::run_stream(Arc::new(config), server_stream, RequestServer { replies }),
+                crate::client::connect_stream(
+                    Arc::new(Config::default()),
+                    client_stream,
+                    Client {}
+                )
+            );
+            let server = server.unwrap();
+            let mut client = client.unwrap();
+            assert!(
+                client
+                    .authenticate_none("synthetic-user")
+                    .await
+                    .unwrap()
+                    .success()
+            );
+            for result in results {
+                assert!(
+                    !result.await.unwrap(),
+                    "unknown request must still be rejected"
+                );
+            }
+            let channel = client.channel_open_session().await.unwrap();
+            channel.close().await.unwrap();
+            client
+                .disconnect(crate::Disconnect::ByApplication, "test complete", "")
+                .await
+                .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }
